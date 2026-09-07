@@ -67,33 +67,41 @@ local Logger = {
     LastErrorTime = 0
 }
 
-local httpRequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+local function GetHttpRequest()
+    return (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request or (getgenv and (getgenv().request or getgenv().http_request))
+end
 
 local function SendLogToServer(tag, msg, trace)
-    if httpRequest then
+    local hr = GetHttpRequest()
+    if hr then
         task.spawn(function()
             pcall(function()
                 local payload = {
-                    tag = tag,
+                    tag = tostring(tag),
                     msg = tostring(msg),
                     trace = trace or "",
                     level = (LocalPlayer and LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Level")) and LocalPlayer.Data.Level.Value or 1,
                     sea = (FastTravel and FastTravel.GetSea) and FastTravel.GetSea() or 1
                 }
-                httpRequest({
-                    Url = "http://127.0.0.1:8080/log",
-                    Method = "POST",
-                    Headers = {
-                        ["Content-Type"] = "application/json"
-                    },
-                    Body = HttpService:JSONEncode(payload)
-                })
+                local encoded = HttpService:JSONEncode(payload)
+                -- Gửi đồng thời tới localhost, IP LAN và Android Emulator host
+                local urls = { "http://127.0.0.1:8080/log", "http://192.168.1.9:8080/log", "http://10.0.2.2:8080/log" }
+                for _, u in ipairs(urls) do
+                    pcall(function()
+                        hr({
+                            Url = u,
+                            Method = "POST",
+                            Headers = { ["Content-Type"] = "application/json" },
+                            Body = encoded
+                        })
+                    end)
+                end
             end)
         end)
     end
     if appendfile then
         pcall(function()
-            appendfile("kaitun_debug.log", string.format("[%s][%s] %s\n", os.date("%H:%M:%S"), tag, tostring(msg)))
+            appendfile("kaitun_debug.log", string.format("[%s][%s] %s\n", os.date("%H:%M:%S"), tostring(tag), tostring(msg)))
         end)
     end
 end
@@ -404,6 +412,9 @@ function TweenEngine.Stop()
     lastStuckPos = nil
 end
 
+local lastTweenLogTime = 0
+local lastTargetLogPos = nil
+
 function TweenEngine.To(targetCFrame, speed, height)
     local char = LocalPlayer.Character
     if not char or not char:FindFirstChild("HumanoidRootPart") or not char:FindFirstChild("Humanoid") then return nil end
@@ -419,6 +430,9 @@ function TweenEngine.To(targetCFrame, speed, height)
     local rot = hrp.CFrame - hrp.Position
     local finalCF = CFrame.new(targetPos) * rot
 
+    -- Bảo đảm nhân vật không bị rơi khi bay
+    if Security and Security.ApplyNoFall then Security.ApplyNoFall(char) end
+
     local dist = (hrp.Position - finalCF.Position).Magnitude
     if dist <= 4 then
         TweenEngine.Stop()
@@ -428,6 +442,13 @@ function TweenEngine.To(targetCFrame, speed, height)
     local actualSpeed = math.min(speed or Config.TweenSpeed or 285, 350)
     local duration = dist / actualSpeed
     local info = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+
+    -- Ghi log chuyển động có kiểm soát tần suất
+    if (tick() - lastTweenLogTime) >= 4 or not lastTargetLogPos or (lastTargetLogPos - targetPos).Magnitude > 80 then
+        lastTweenLogTime = tick()
+        lastTargetLogPos = targetPos
+        Logger.Log("TWEEN", string.format("Bay tới (%d, %d, %d) | Khoảng cách: %d studs | Tốc độ: %d", math.floor(targetPos.X), math.floor(targetPos.Y), math.floor(targetPos.Z), math.floor(dist), actualSpeed))
+    end
 
     if activeTween then activeTween:Cancel() end
     activeTween = TweenService:Create(hrp, info, { CFrame = finalCF })
@@ -440,7 +461,9 @@ function TweenEngine.To(targetCFrame, speed, height)
     else
         local dMoved = (hrp.Position - lastStuckPos).Magnitude
         if dMoved < 3 and (tick() - stuckTimer) >= 3 then
+            Logger.Warn("ANTI_STUCK", string.format("Kẹt vị trí (%d, %d, %d) quá 3s -> Tự nâng độ cao +50 studs và đặt lại vận tốc!", math.floor(hrp.Position.X), math.floor(hrp.Position.Y), math.floor(hrp.Position.Z)))
             hrp.CFrame = hrp.CFrame + Vector3.new(0, 50, 0)
+            hrp.Velocity = Vector3.new(0, 0, 0)
             lastStuckPos = hrp.Position
             stuckTimer = tick()
         elseif dMoved >= 5 then
@@ -469,36 +492,54 @@ function FastAttack.EnsureBuso()
     end
 end
 
+local lastAttackLogTime = 0
+
 function FastAttack.EquipWeapon(prefType)
     prefType = prefType or "Melee"
     local char = LocalPlayer.Character
-    if not char or not char:FindFirstChild("Humanoid") then return end
+    if not char or not char:FindFirstChild("Humanoid") then return nil end
 
     local equipped = char:FindFirstChildOfClass("Tool")
-    if equipped and (equipped.ToolTip == prefType or (prefType == "Melee" and equipped.ToolTip == "Sword")) then
-        FastAttack.EnsureBuso()
-        return equipped
+    if equipped then
+        if equipped.ToolTip == prefType or (prefType == "Melee" and equipped.ToolTip == "Sword") or equipped.Name:find("Combat") or equipped.Name:find("Step") or equipped.Name:find("Karate") or equipped.Name:find("Claw") then
+            FastAttack.EnsureBuso()
+            return equipped
+        end
     end
 
     local bp = LocalPlayer:FindFirstChild("Backpack")
     if bp then
+        -- 1. Ưu tiên tool có ToolTip == prefType
         for _, t in ipairs(bp:GetChildren()) do
             if t:IsA("Tool") and t.ToolTip == prefType then
                 char.Humanoid:EquipTool(t)
                 FastAttack.EnsureBuso()
+                Logger.Log("COMBAT", "Đã trang bị vũ khí:", t.Name)
                 return t
             end
         end
+        -- 2. Tìm theo ToolTip Sword nếu Melee không có
         if prefType == "Melee" then
             for _, t in ipairs(bp:GetChildren()) do
                 if t:IsA("Tool") and t.ToolTip == "Sword" then
                     char.Humanoid:EquipTool(t)
                     FastAttack.EnsureBuso()
+                    Logger.Log("COMBAT", "Trang bị kiếm thay thế:", t.Name)
                     return t
                 end
             end
         end
+        -- 3. Trang bị bất kỳ tool nào có sẵn trừ Fruit / Key
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") and not t.Name:find("Fruit") and not t.Name:find("Key") then
+                char.Humanoid:EquipTool(t)
+                FastAttack.EnsureBuso()
+                Logger.Log("COMBAT", "Trang bị vũ khí có sẵn:", t.Name)
+                return t
+            end
+        end
     end
+    return nil
 end
 
 local lastHitTime = 0
@@ -507,13 +548,16 @@ function FastAttack.Execute()
     local char = LocalPlayer.Character
     if not char or not char:FindFirstChild("HumanoidRootPart") then return end
 
-    FastAttack.EquipWeapon("Melee")
+    local tool = FastAttack.EquipWeapon("Melee")
 
     local enemies = workspace:FindFirstChild("Enemies")
     if not enemies then return end
 
     local parts = {}
     local primaryHead = nil
+    local targetMobName = "quái"
+    local targetMobHP = 0
+    local targetMobMaxHP = 0
 
     for _, enemy in ipairs(enemies:GetChildren()) do
         if enemy:IsA("Model") and enemy ~= char then
@@ -521,7 +565,12 @@ function FastAttack.Execute()
             local eHum = enemy:FindFirstChildOfClass("Humanoid")
             if eHrp and eHum and eHum.Health > 0 then
                 if (char.HumanoidRootPart.Position - eHrp.Position).Magnitude <= Config.AttackDistance then
-                    if not primaryHead then primaryHead = enemy:FindFirstChild("Head") end
+                    if not primaryHead then
+                        primaryHead = enemy:FindFirstChild("Head")
+                        targetMobName = enemy.Name
+                        targetMobHP = math.floor(eHum.Health)
+                        targetMobMaxHP = math.floor(eHum.MaxHealth)
+                    end
                     for _, p in ipairs(enemy:GetChildren()) do
                         if p:IsA("BasePart") then
                             parts[#parts + 1] = { enemy, p }
@@ -534,6 +583,7 @@ function FastAttack.Execute()
 
     if #parts == 0 or not primaryHead then return end
 
+    local netSuccess = false
     local netFolder = ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("Net")
     if netFolder then
         local regAtk = netFolder:FindFirstChild("RE/RegisterAttack")
@@ -555,11 +605,25 @@ function FastAttack.Execute()
                 local sToken = bit32.bxor(atkId + 909090, sSeed * 2)
                 atkRem:FireServer(encMethod, sToken, primaryHead, parts)
             end
+            netSuccess = true
             lastHitTime = tick()
         end
     end
+
+    -- Fallback nếu Net remote bị thay đổi: Kích hoạt tool thủ công
+    if not netSuccess and tool then
+        tool:Activate()
+        lastHitTime = tick()
+    end
+
+    -- Ghi log đánh quái định kỳ mỗi 3 giây
+    if (tick() - lastAttackLogTime) >= 3 then
+        lastAttackLogTime = tick()
+        Logger.Log("ATTACK", string.format("Đang đánh '%s' [HP: %d/%d] | %d bộ phận dính sát thương", targetMobName, targetMobHP, targetMobMaxHP, #parts))
+    end
 end
 
+local lastBringLogTime = 0
 local MobAura = {}
 function MobAura.BringMob(mobName)
     if not Config.BringMob then return end
@@ -587,13 +651,22 @@ function MobAura.BringMob(mobName)
     local lead = list[1]:FindFirstChild("HumanoidRootPart") or list[1].PrimaryPart
     if not lead then return end
 
+    local countBrought = 0
     for i = 2, #list do
         local sub = list[i]:FindFirstChild("HumanoidRootPart") or list[i].PrimaryPart
         if sub then
             if not isnetworkowner or isnetworkowner(sub) then
                 sub.CFrame = lead.CFrame
+                sub.CanCollide = false
+                sub.Velocity = Vector3.new(0, 0, 0)
+                countBrought = countBrought + 1
             end
         end
+    end
+
+    if countBrought > 0 and (tick() - lastBringLogTime) >= 3 then
+        lastBringLogTime = tick()
+        Logger.Log("BRING_MOB", string.format("Gom thành công %d quái '%s' về cùng một điểm", countBrought, tostring(mobName or "quái")))
     end
 end
 
@@ -708,7 +781,7 @@ function FruitVault.AutoStoreFruits()
                     -- Nếu chưa cất vào kho -> Cất ngay lập tức!
                     if not alreadyInStorage then
                         Network.InvokeCommF("StoreFruit", oriName, tool)
-                        print("[Fruit Vault] Đã cất an toàn trái:", oriName)
+                        Logger.Log("FRUIT", "Đã cất an toàn trái vào kho:", oriName)
                     end
                 end
             end
@@ -784,7 +857,7 @@ function FruitVault.AutoRollFruitRemote()
         pcall(function()
             if writefile then writefile(ROLL_CACHE_FILE, tostring(lastRollFruitTime)) end
         end)
-        print("[Auto Gacha] Đã roll trái từ xa! Kết quả:", tostring(res))
+        Logger.Log("GACHA", "Đã roll trái từ xa! Kết quả:", tostring(res))
 
         -- Cất ngay trái vừa roll được vào kho an toàn!
         task.wait(0.5)
@@ -959,76 +1032,161 @@ function LevelFarm.GetNPCPos(qName)
     return nil
 end
 
+local sky3TeleportAttempts = 0
+local sky2TeleportAttempts = 0
+local lastSkySkipLogTime = 0
+local lastQuestFarmLogTime = 0
+
+function LevelFarm.HasQuest()
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if pGui and pGui:FindFirstChild("Main") and pGui.Main:FindFirstChild("Quest") then
+        return pGui.Main.Quest.Visible
+    end
+    return CurrentQuestTarget ~= ""
+end
+
 function LevelFarm.Step()
     local lv = LocalPlayer.Data.Level.Value
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
 
-    -- Sea 1 Sky Skip: Nhảy vọt cấp với Shanda & God's Guard
+    -- Sea 1 Sky Skip: Nhảy vọt cấp siêu tốc với Shanda & God's Guard
     if FastTravel.IsSea1() and Config.SkySkipSea1 then
-        if lv >= 10 and lv < 70 then
-            if LocalPlayer:GetAttribute("CurrentLocation") ~= "Upper Skylands" then
-                FastTravel.TeleportLocation("sky 3")
-                task.wait(1)
+
+        -- GIAI ĐOẠN 1 (Level 1 - 69): Lên thẳng Sky 3 (Upper Skylands) đánh Shanda (Cấp 475)
+        if lv < 70 then
+            -- Sky 3 nằm ở độ cao Y > 4500
+            if hrp.Position.Y < 4500 then
+                HUD.SetStatus("⚡ Sky Skip: Đang dịch chuyển lên Sky 3...")
+                if sky3TeleportAttempts < 2 then
+                    Logger.Log("SKYSKIP", string.format("Y = %d < 4500 -> Gửi lệnh dịch chuyển lên Sky 3 (Lần %d)...", math.floor(hrp.Position.Y), sky3TeleportAttempts + 1))
+                    FastTravel.TeleportLocation("sky 3")
+                    sky3TeleportAttempts = sky3TeleportAttempts + 1
+                    task.wait(1.5)
+                else
+                    -- Fallback: Dùng Tween bay thẳng lên Sky 3
+                    Logger.Log("SKYSKIP", string.format("Y = %d -> FastTravel không dịch chuyển được, kích hoạt Tween bay thẳng lên Sky 3 (-7783, 5576, -519)...", math.floor(hrp.Position.Y)))
+                    TweenEngine.To(Vector3.new(-7783, 5576, -519), 350, 0)
+                end
                 return
             end
+
+            -- Đã ở trên Sky 3 (Y >= 4500)
+            sky3TeleportAttempts = 0
+            HUD.SetStatus(string.format("⚡ Sky Skip: Đang farm Shanda (Lv %d/70)", lv))
             local shanda = MobAura.GetNearest("Shanda")
-            if shanda and shanda:FindFirstChild("HumanoidRootPart") then
-                TweenEngine.To(shanda.HumanoidRootPart.CFrame, 350, 20)
-                if (LocalPlayer.Character.HumanoidRootPart.Position - shanda.HumanoidRootPart.Position).Magnitude <= 40 then
+            if shanda and shanda:FindFirstChild("HumanoidRootPart") and shanda:FindFirstChildOfClass("Humanoid") then
+                local hum = shanda:FindFirstChildOfClass("Humanoid")
+                local dist = math.floor((hrp.Position - shanda.HumanoidRootPart.Position).Magnitude)
+                if (tick() - lastSkySkipLogTime) >= 3 then
+                    lastSkySkipLogTime = tick()
+                    Logger.Log("SKYSKIP", string.format("Đang đánh Shanda [HP: %d/%d] | Cách: %d studs | Level người chơi: %d/70", math.floor(hum.Health), math.floor(hum.MaxHealth), dist, lv))
+                end
+                TweenEngine.To(shanda.HumanoidRootPart.CFrame, 350, 16)
+                if dist <= 40 then
                     MobAura.BringMob("Shanda")
                     FastAttack.Execute()
                 end
             else
+                if (tick() - lastSkySkipLogTime) >= 4 then
+                    lastSkySkipLogTime = tick()
+                    Logger.Log("SKYSKIP", "Chưa thấy Shanda spawn trong workspace.Enemies, bay tới bãi spawn (-7783, 5576, -519)...")
+                end
                 TweenEngine.To(Vector3.new(-7783, 5576, -519), 350, 20)
             end
             return
+
+        -- GIAI ĐOẠN 2 (Level 70 - 119): Sang Sky 2 (Skylands) đánh God's Guard (Cấp 575)
         elseif lv >= 70 and lv < 120 then
-            if LocalPlayer:GetAttribute("CurrentLocation") ~= "Skylands" then
-                FastTravel.TeleportLocation("sky 2")
-                task.wait(1)
+            -- Sky 2 nằm ở độ cao Y khoảng 700 - 1500
+            if hrp.Position.Y < 600 or hrp.Position.Y > 2500 then
+                HUD.SetStatus("⚡ Sky Skip: Đang dịch chuyển sang Sky 2...")
+                if sky2TeleportAttempts < 2 then
+                    Logger.Log("SKYSKIP", string.format("Y = %d -> Gửi lệnh dịch chuyển sang Sky 2 (Lần %d)...", math.floor(hrp.Position.Y), sky2TeleportAttempts + 1))
+                    FastTravel.TeleportLocation("sky 2")
+                    sky2TeleportAttempts = sky2TeleportAttempts + 1
+                    task.wait(1.5)
+                else
+                    Logger.Log("SKYSKIP", string.format("Y = %d -> Bay thẳng sang Sky 2 (-4698, 845, -1912) bằng Tween...", math.floor(hrp.Position.Y)))
+                    TweenEngine.To(Vector3.new(-4698, 845, -1912), 350, 0)
+                end
                 return
             end
+
+            -- Đã ở trên Sky 2
+            sky2TeleportAttempts = 0
+            HUD.SetStatus(string.format("⚡ Sky Skip: Đang farm God's Guard (Lv %d/120)", lv))
             local guard = MobAura.GetNearest("God's Guard")
-            if guard and guard:FindFirstChild("HumanoidRootPart") then
-                TweenEngine.To(guard.HumanoidRootPart.CFrame, 350, 20)
-                if (LocalPlayer.Character.HumanoidRootPart.Position - guard.HumanoidRootPart.Position).Magnitude <= 40 then
+            if guard and guard:FindFirstChild("HumanoidRootPart") and guard:FindFirstChildOfClass("Humanoid") then
+                local hum = guard:FindFirstChildOfClass("Humanoid")
+                local dist = math.floor((hrp.Position - guard.HumanoidRootPart.Position).Magnitude)
+                if (tick() - lastSkySkipLogTime) >= 3 then
+                    lastSkySkipLogTime = tick()
+                    Logger.Log("SKYSKIP", string.format("Đang đánh God's Guard [HP: %d/%d] | Cách: %d studs | Level người chơi: %d/120", math.floor(hum.Health), math.floor(hum.MaxHealth), dist, lv))
+                end
+                TweenEngine.To(guard.HumanoidRootPart.CFrame, 350, 16)
+                if dist <= 40 then
                     MobAura.BringMob("God's Guard")
                     FastAttack.Execute()
                 end
             else
+                if (tick() - lastSkySkipLogTime) >= 4 then
+                    lastSkySkipLogTime = tick()
+                    Logger.Log("SKYSKIP", "Chưa thấy God's Guard spawn, bay tới bãi spawn (-4698, 845, -1912)...")
+                end
                 TweenEngine.To(Vector3.new(-4698, 845, -1912), 350, 20)
             end
             return
         end
     end
 
-    -- Farm theo Quest Chuẩn
+    -- Farm theo Quest Chuẩn (Lv 120+ hoặc không bật SkySkip)
     local qInfo = LevelFarm.GetBest()
     if not qInfo or not qInfo.Q then
         Logger.Warn("FARM", "Không tìm thấy nhiệm vụ phù hợp cho Lv " .. tostring(lv))
         return
     end
 
-    if CurrentQuestTarget == "" then
+    local hasQuest = LevelFarm.HasQuest()
+
+    if not hasQuest then
         local npcPos = LevelFarm.GetNPCPos(qInfo.Q)
         if npcPos then
-            Logger.Log("FARM", "Bay đến NPC nhận Quest:", qInfo.Q, "(ID: " .. tostring(qInfo.ID) .. ")")
+            local dist = math.floor((hrp.Position - npcPos).Magnitude)
+            if (tick() - lastQuestFarmLogTime) >= 4 then
+                lastQuestFarmLogTime = tick()
+                Logger.Log("QUEST", string.format("Chưa có Quest -> Bay đến NPC nhận Quest: %s (ID: %s) [Cách %d studs]", tostring(qInfo.Q), tostring(qInfo.ID), dist))
+            end
             TweenEngine.To(npcPos, 350, 5)
-            if (LocalPlayer.Character.HumanoidRootPart.Position - npcPos).Magnitude <= 15 then
-                Network.InvokeCommF("StartQuest", qInfo.Q, qInfo.ID)
+            if dist <= 15 then
+                local res = Network.InvokeCommF("StartQuest", qInfo.Q, qInfo.ID)
+                Logger.Log("QUEST", string.format("Đã gửi lệnh nhận Quest %s (ID: %s) -> Kết quả: %s", tostring(qInfo.Q), tostring(qInfo.ID), tostring(res)))
+                task.wait(0.5)
             end
         else
-            Logger.Warn("FARM", "Không tìm thấy vị trí NPC cho quest:", qInfo.Q)
+            Logger.Warn("QUEST", "Không tìm thấy vị trí NPC cho quest: " .. tostring(qInfo.Q))
         end
     else
-        local mob = MobAura.GetNearest(CurrentQuestTarget)
-        if mob and mob:FindFirstChild("HumanoidRootPart") then
-            Logger.Log("FARM", "Đang đánh quái:", CurrentQuestTarget, "| Khoảng cách:", math.floor((LocalPlayer.Character.HumanoidRootPart.Position - mob.HumanoidRootPart.Position).Magnitude))
-            TweenEngine.To(mob.HumanoidRootPart.CFrame, 350, 20)
-            if (LocalPlayer.Character.HumanoidRootPart.Position - mob.HumanoidRootPart.Position).Magnitude <= 40 then
-                MobAura.BringMob(CurrentQuestTarget)
+        local targetMob = (CurrentQuestTarget ~= "" and CurrentQuestTarget) or qInfo.M
+        local mob = MobAura.GetNearest(targetMob)
+        if mob and mob:FindFirstChild("HumanoidRootPart") and mob:FindFirstChildOfClass("Humanoid") then
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            local dist = math.floor((hrp.Position - mob.HumanoidRootPart.Position).Magnitude)
+            if (tick() - lastQuestFarmLogTime) >= 3 then
+                lastQuestFarmLogTime = tick()
+                Logger.Log("FARM", string.format("Đang làm nhiệm vụ [%s] -> Đánh quái '%s' [HP: %d/%d, Cách: %d studs]", tostring(qInfo.Q), tostring(targetMob), math.floor(hum.Health), math.floor(hum.MaxHealth), dist))
+            end
+            TweenEngine.To(mob.HumanoidRootPart.CFrame, 350, 16)
+            if dist <= 40 then
+                MobAura.BringMob(targetMob)
                 FastAttack.Execute()
             end
         else
+            if (tick() - lastQuestFarmLogTime) >= 4 then
+                lastQuestFarmLogTime = tick()
+                Logger.Log("FARM", string.format("Quái '%s' chưa spawn, bay tới bãi chờ spawn...", tostring(targetMob)))
+            end
             local npcPos = LevelFarm.GetNPCPos(qInfo.Q)
             if npcPos then TweenEngine.To(npcPos + Vector3.new(0, 30, 0), 300) end
         end
@@ -1083,7 +1241,7 @@ function AutoRaid.StartSafeRaid()
                 Network.InvokeCommF("LoadFruit", trashFruitKey)
                 task.wait(0.5)
                 Network.InvokeCommF("RaidsNpc", "Select", "Dark")
-                print("[Auto Raid] Đã dùng trái rác an toàn làm vé:", trashFruitKey)
+                Logger.Log("RAID", "Đã dùng trái rác an toàn làm vé:", trashFruitKey)
             else
                 -- Không có Beli và không có trái rác -> Bỏ qua, không mạo hiểm!
                 return false
@@ -1302,12 +1460,35 @@ Security.Init()
 if LocalPlayer.Character then Security.ApplyNoFall(LocalPlayer.Character) end
 LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.5) Security.ApplyNoFall(c) end)
 
-if not LocalPlayer.Team then
-    repeat
-        pcall(function() Network.InvokeCommF("SetTeam", Config.Team or "Pirates") end)
-        task.wait(0.5)
-    until LocalPlayer.Team
-end
+-- Chọn Phe không làm treo luồng khởi động chính
+task.spawn(function()
+    if not LocalPlayer.Team then
+        Logger.Log("TEAM", "Chưa chọn phe, đang gửi yêu cầu chọn phe " .. tostring(Config.Team or "Marines") .. "...")
+        local teamAttempts = 0
+        while not LocalPlayer.Team and teamAttempts < 15 do
+            pcall(function()
+                Network.InvokeCommF("SetTeam", Config.Team or "Marines")
+                local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+                if pGui and pGui:FindFirstChild("Main") and pGui.Main:FindFirstChild("ChooseTeam") then
+                    local choose = pGui.Main.ChooseTeam
+                    local btn = choose:FindFirstChild("Container") and choose.Container:FindFirstChild(Config.Team or "Marines")
+                    if btn and btn:FindFirstChild("Frame") and btn.Frame:FindFirstChild("ViewportFrame") and btn.Frame.ViewportFrame:FindFirstChild("TextButton") then
+                        if firesignal then firesignal(btn.Frame.ViewportFrame.TextButton.MouseButton1Click) end
+                    end
+                end
+            end)
+            task.wait(1)
+            teamAttempts = teamAttempts + 1
+        end
+        if LocalPlayer.Team then
+            Logger.Log("TEAM", "Đã vào phe thành công: " .. tostring(LocalPlayer.Team.Name))
+        else
+            Logger.Warn("TEAM", "Hết thời gian chờ chọn phe, tiếp tục tiến trình...")
+        end
+    else
+        Logger.Log("TEAM", "Hiện tại đang ở phe: " .. tostring(LocalPlayer.Team.Name))
+    end
+end)
 
 -- Tối ưu đồ họa
 pcall(function()
@@ -1346,12 +1527,19 @@ task.spawn(function()
                 local maxCap = workspace:GetAttribute("LEVEL_CAP") or 2550
                 local mLv = stats.Melee and stats.Melee.Level.Value or 0
                 local dLv = stats.Defense and stats.Defense.Level.Value or 0
-                if dLv < maxCap and (dLv < (LocalPlayer.Data.Level.Value / 80) or (maxCap - mLv) < 100) then
-                    Network.InvokeCommF("AddPoint", "Defense", 999)
-                elseif mLv < maxCap then
-                    Network.InvokeCommF("AddPoint", "Melee", 999)
-                else
-                    Network.InvokeCommF("AddPoint", "Sword", 999)
+                local statPoints = LocalPlayer.Data:FindFirstChild("Points") and LocalPlayer.Data.Points.Value or 0
+                if statPoints > 0 then
+                    -- Phân bổ cân bằng: 60% Melee, 40% Defense để nhân vật không bị quái one-shot
+                    if dLv < (mLv * 0.6) and dLv < maxCap then
+                        Network.InvokeCommF("AddPoint", "Defense", statPoints)
+                        Logger.Log("STATS", string.format("Đã cộng %d điểm vào Defense (Defense: %d, Melee: %d)", statPoints, dLv + statPoints, mLv))
+                    elseif mLv < maxCap then
+                        Network.InvokeCommF("AddPoint", "Melee", statPoints)
+                        Logger.Log("STATS", string.format("Đã cộng %d điểm vào Melee (Melee: %d, Defense: %d)", statPoints, mLv + statPoints, dLv))
+                    else
+                        Network.InvokeCommF("AddPoint", "Sword", statPoints)
+                        Logger.Log("STATS", string.format("Đã cộng %d điểm vào Sword", statPoints))
+                    end
                 end
             end
 
@@ -1359,6 +1547,7 @@ task.spawn(function()
             if FastTravel.IsSea3() then
                 if MeleeFarm.GetMaterial("Bones") >= 50 then
                     Network.InvokeCommF("Bones", "Buy", 1, 1)
+                    Logger.Log("BONES", "Đã đổi 50 Xương lấy quà tại Sea 3!")
                 end
             end
         end)
@@ -1370,6 +1559,7 @@ task.spawn(function()
 end)
 
 -- VÒNG LẶP THỰC THI CHÍNH: CHỈ TẬP TRUNG GODHUMAN VÀ MAX LEVEL
+local lastHeartbeat = 0
 task.spawn(function()
     while true do
         local ok, err = pcall(function()
@@ -1382,6 +1572,15 @@ task.spawn(function()
             local myLevel = LocalPlayer.Data.Level.Value
             local beli = LocalPlayer.Data.Beli.Value
             local frags = LocalPlayer.Data.Fragments.Value
+
+            -- Heartbeat định kỳ mỗi 5 giây gửi tình trạng bot về Server
+            if (tick() - lastHeartbeat) >= 5 then
+                lastHeartbeat = tick()
+                local pos = char.HumanoidRootPart.Position
+                local currentStatus = lblStatus and lblStatus.Text or "Đang hoạt động"
+                local currentGoal = lblGoal and lblGoal.Text or "Không rõ"
+                Logger.Log("HEARTBEAT", string.format("Acc: %s | Sea: %d | Lv: %d | Beli: %s | Frags: %s | Pos: (%d, %d, %d) | %s | %s", LocalPlayer.Name, FastTravel.GetSea(), myLevel, tostring(beli), tostring(frags), math.floor(pos.X), math.floor(pos.Y), math.floor(pos.Z), currentStatus, currentGoal))
+            end
 
             -- Tự mua Haki căn bản
             MeleeFarm.AutoBuyHaki()
@@ -1604,5 +1803,6 @@ task.spawn(function()
     end
 end)
 
-Logger.Log("INIT", "Khởi chạy bản Speedrun Godhuman & Max Level thành công!")
+Logger.Log("INIT", "=== BẢN SPEEDRUN GODHUMAN & MAX LEVEL ĐÃ NẠP THÀNH CÔNG ===")
+Logger.Log("INIT", string.format("Tài khoản: %s | Sea: %d | Level: %s", LocalPlayer.Name, FastTravel.GetSea(), tostring((LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Level")) and LocalPlayer.Data.Level.Value or "Đang tải...")))
 warn("[Kaitun Godhuman & Max Level] Đã khởi chạy bản Speedrun chuyên biệt thành công!")
