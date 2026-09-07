@@ -58,7 +58,7 @@ local Config = {
 }
 
 -- ========================================================
--- [HỆ THỐNG DEBUG LOGGER CHUYÊN SÂU]
+-- [HỆ THỐNG DEBUG LOGGER CHUYÊN SÂU & HTTP BRIDGE]
 -- ========================================================
 local HUD = {} -- Định nghĩa trước để Logger có thể đẩy text lên HUD
 local Logger = {
@@ -66,6 +66,37 @@ local Logger = {
     LastError = nil,
     LastErrorTime = 0
 }
+
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+
+local function SendLogToServer(tag, msg, trace)
+    if httpRequest then
+        task.spawn(function()
+            pcall(function()
+                local payload = {
+                    tag = tag,
+                    msg = tostring(msg),
+                    trace = trace or "",
+                    level = (LocalPlayer and LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Level")) and LocalPlayer.Data.Level.Value or 1,
+                    sea = (FastTravel and FastTravel.GetSea) and FastTravel.GetSea() or 1
+                }
+                httpRequest({
+                    Url = "http://127.0.0.1:8080/log",
+                    Method = "POST",
+                    Headers = {
+                        ["Content-Type"] = "application/json"
+                    },
+                    Body = HttpService:JSONEncode(payload)
+                })
+            end)
+        end)
+    end
+    if appendfile then
+        pcall(function()
+            appendfile("kaitun_debug.log", string.format("[%s][%s] %s\n", os.date("%H:%M:%S"), tag, tostring(msg)))
+        end)
+    end
+end
 
 function Logger.Log(tag, ...)
     local args = { ... }
@@ -79,6 +110,7 @@ function Logger.Log(tag, ...)
         end
     end
     if HUD and HUD.SetDebug then HUD.SetDebug(Logger.LastLog) end
+    SendLogToServer(tag, msg)
 end
 
 function Logger.Warn(tag, ...)
@@ -90,6 +122,7 @@ function Logger.Warn(tag, ...)
         pcall(function() rconsolewarn(string.format("[WARN][%s] %s\n", tag, msg)) end)
     end
     if HUD and HUD.SetDebug then HUD.SetDebug("⚠️ " .. msg) end
+    SendLogToServer("WARN", msg)
 end
 
 function Logger.Error(tag, err, trace)
@@ -100,6 +133,7 @@ function Logger.Error(tag, err, trace)
         local traceInfo = trace or debug.traceback()
         warn(string.format("[ERROR][%s] %s\nStack trace:\n%s", tag, msg, tostring(traceInfo)))
         if HUD and HUD.SetDebug then HUD.SetDebug("❌ " .. msg) end
+        SendLogToServer("ERROR", msg, tostring(traceInfo))
     end
 end
 
@@ -1508,7 +1542,10 @@ task.spawn(function()
             -- ========================================================
             -- [BƯỚC 4: THU THẬP NGUYÊN LIỆU GODHUMAN]
             -- ========================================================
-            if MeleeFarm.GetMastery("Godhuman") == 0 then
+            -- CHỈ thu thập nguyên liệu Godhuman khi:
+            -- 1. Đã đạt ít nhất Level 1400+ (gần Max Sea 2 hoặc đã ở Sea 3)
+            -- 2. VÀ CHỈ farm nguyên liệu thuộc Sea HIỆN TẠI mà người chơi đang đứng! Tuyệt đối không nhảy Sea bừa bãi khi chưa đủ điều kiện!
+            if myLevel >= 1400 and MeleeFarm.GetMastery("Godhuman") == 0 then
                 local GodhumanMaterials = {
                     { Name = "Dragon Scale", Max = 20, Sea = 3, Mob = "Dragon Crew Warrior" },
                     { Name = "Fish Tail", Max = 20, Sea = 3, Mob = "Fishman Raider" },
@@ -1516,28 +1553,23 @@ task.spawn(function()
                     { Name = "Magma Ore", Max = 20, Sea = 2, Mob = "Magma Ninja" }
                 }
 
+                local currentSea = FastTravel.GetSea()
                 for _, mat in ipairs(GodhumanMaterials) do
-                    local count = MeleeFarm.GetMaterial(mat.Name)
-                    if count < mat.Max then
-                        HUD.SetGoal(string.format("Nguyên liệu: %s (%d/%d)", mat.Name, count, mat.Max))
-                        if FastTravel.GetSea() ~= mat.Sea then
-                            HUD.SetStatus("Chuyển Sea để farm " .. mat.Name)
-                            Logger.Log("MATERIAL", "Cần đổi sang Sea " .. tostring(mat.Sea) .. " để farm " .. mat.Name)
-                            if mat.Sea == 2 then Network.InvokeCommF("TravelDressrosa")
-                            elseif mat.Sea == 3 then Network.InvokeCommF("TravelZou") end
-                            task.wait(5)
+                    -- CHỈ farm nguyên liệu nếu nó thuộc Sea hiện tại của người chơi!
+                    if mat.Sea == currentSea then
+                        local count = MeleeFarm.GetMaterial(mat.Name)
+                        if count < mat.Max then
+                            HUD.SetGoal(string.format("Nguyên liệu: %s (%d/%d)", mat.Name, count, mat.Max))
+                            local mob = MobAura.GetNearest(mat.Mob)
+                            if mob and mob:FindFirstChild("HumanoidRootPart") then
+                                TweenEngine.To(mob.HumanoidRootPart.CFrame, 350, 20)
+                                if (char.HumanoidRootPart.Position - mob.HumanoidRootPart.Position).Magnitude <= 40 then
+                                    MobAura.BringMob(mat.Mob)
+                                    FastAttack.Execute()
+                                end
+                            end
                             return
                         end
-
-                        local mob = MobAura.GetNearest(mat.Mob)
-                        if mob and mob:FindFirstChild("HumanoidRootPart") then
-                            TweenEngine.To(mob.HumanoidRootPart.CFrame, 350, 20)
-                            if (char.HumanoidRootPart.Position - mob.HumanoidRootPart.Position).Magnitude <= 40 then
-                                MobAura.BringMob(mat.Mob)
-                                FastAttack.Execute()
-                            end
-                        end
-                        return
                     end
                 end
 
